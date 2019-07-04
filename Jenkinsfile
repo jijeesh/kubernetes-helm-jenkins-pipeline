@@ -1,404 +1,200 @@
-/*
-    This is an example pipeline that implement full CI/CD for a simple static web site packed in a Docker image.
+#!groovy
 
-    The pipeline is made up of 6 main steps
-    1. Git clone and setup
-    2. Build and local tests
-    3. Publish Docker and Helm
-    4. Deploy to dev and test
-    5. Deploy to staging and test
-    6. Optionally deploy to production and test
- */
+def kubectlTest() {
+    // Test that kubectl can correctly communication with the Kubernetes API
+    echo "running kubectl test"
+    sh "kubectl get nodes"
 
-/*
-    Create the kubernetes namespace
- */
-def createNamespace (namespace) {
-    echo "Creating namespace ${namespace} if needed"
-
-    sh "[ ! -z \"\$(kubectl get ns ${namespace} -o name 2>/dev/null)\" ] || kubectl create ns ${namespace}"
 }
 
-/*
-    Helm install
- */
-def helmInstall (namespace, release) {
-    echo "Installing ${release} in ${namespace}"
+def helmLint(String chart_dir) {
+    // lint helm chart
+    sh "/usr/local/bin/helm lint ${chart_dir}"
 
-    script {
-        release = "${release}-${namespace}"
-        sh "helm repo add helm ${HELM_REPO}; helm repo update"
-        sh """
-            helm upgrade --install --namespace ${namespace} ${release} \
-                --set imagePullSecrets=${IMG_PULL_SECRET} \
-                --set image.repository=${DOCKER_REG}/${IMAGE_NAME},image.tag=${DOCKER_TAG} helm/acme
-        """
-        sh "sleep 5"
+}
+
+def helmDeploy(Map args) {
+    //configure helm client and confirm tiller process is installed
+
+    if (args.dry_run) {
+        println "Running dry-run deployment"
+
+        sh "/usr/local/bin/helm upgrade --dry-run --debug --install ${args.name} ${args.chart_dir} --set ImageTag=${args.tag},Replicas=${args.replicas},Cpu=${args.cpu},Memory=${args.memory},DomainName=${args.name} --namespace=${args.name}"
+    } else {
+        println "Running deployment"
+        sh "/usr/local/bin/helm upgrade --install ${args.name} ${args.chart_dir} --set ImageTag=${args.tag},Replicas=${args.replicas},Cpu=${args.cpu},Memory=${args.memory},DomainName=${args.name} --namespace=${args.name}"
+
+        echo "Application ${args.name} successfully deployed. Use helm status ${args.name} to check"
     }
 }
 
-/*
-    Helm delete (if exists)
- */
-def helmDelete (namespace, release) {
-    echo "Deleting ${release} in ${namespace} if deployed"
 
-    script {
-        release = "${release}-${namespace}"
-        sh "[ -z \"\$(helm ls --short ${release} 2>/dev/null)\" ] || helm delete --purge ${release}"
+
+
+node {
+    
+    // Setup the Docker Registry (Docker Hub) + Credentials 
+    registry_url = "https://index.docker.io/v1/" // Docker Hub
+    docker_creds_id = "judexzhu-DockerHub" // name of the Jenkins Credentials ID
+    build_tag = "1.0" // default tag to push for to the registry
+    
+    def pwd = pwd()
+    def chart_dir = "${pwd}/charts/newegg-nginx"
+        
+    stage 'Checking out GitHub Repo'
+    git url: 'https://github.com/judexzhu/Jenkins-Pipeline-CI-CD-with-Helm-on-Kubernetes.git'
+    
+    def inputFile = readFile('config.json')
+    def config = new groovy.json.JsonSlurperClassic().parseText(inputFile)
+    println "pipeline config ==> ${config}"
+    
+    stage 'Building Nginx Container for Docker Hub'
+    docker.withRegistry("${registry_url}", "${docker_creds_id}") {
+    
+        // Set up the container to build 
+        maintainer_name = "judexzhu"
+        container_name = "nginx-test"
+        
+
+        stage "Building"
+        echo "Building Nginx with docker.build(${maintainer_name}/${container_name}:${build_tag})"
+        container = docker.build("${maintainer_name}/${container_name}:${build_tag}", '.')
+        try {
+            
+            // Start Testing
+            stage "Running Nginx container"
+            
+            // Run the container with the env file, mounted volumes and the ports:
+            docker.image("${maintainer_name}/${container_name}:${build_tag}").withRun("--name=${container_name}  -p 80:80 ")  { c ->
+                   
+                // wait for the django server to be ready for testing
+                // the 'waitUntil' block needs to return true to stop waiting
+                // in the future this will be handy to specify waiting for a max interval: 
+                // https://issues.jenkins-ci.org/browse/JENKINS-29037
+                //
+                waitUntil {
+                    sh "ss -antup | grep 80 | grep LISTEN | wc -l | tr -d '\n' > /tmp/wait_results"
+                    wait_results = readFile '/tmp/wait_results'
+
+                    echo "Wait Results(${wait_results})"
+                    if ("${wait_results}" == "1")
+                    {
+                        echo "Nginx is listening on port 80"
+                        sh "rm -f /tmp/wait_results"
+                        return true
+                    }
+                    else
+                    {
+                        echo "Nginx is not listening on port 80 yet"
+                        return false
+                    }
+                } // end of waitUntil
+                
+                // At this point Nginx is running
+                echo "Docker Container is running"
+                input 'You can Check the running Docker Container on docker builder server now! Click process to the next stage!!'    
+                // this pipeline is using 3 tests 
+                // by setting it to more than 3 you can test the error handling and see the pipeline Stage View error message
+                MAX_TESTS = 3
+                for (test_num = 0; test_num < MAX_TESTS; test_num++) {     
+                   
+                    echo "Running Test(${test_num})"
+                
+                    expected_results = 0
+                    if (test_num == 0 ) 
+                    {
+                        // Test we can download the home page from the running django docker container
+                        sh "docker exec -t ${container_name} curl -s http://localhost | grep Welcome | wc -l | tr -d '\n' > /tmp/test_results" 
+                        expected_results = 1
+                    }
+                    else if (test_num == 1)
+                    {
+                        // Test that port 80 is exposed
+                        echo "Exposed Docker Ports:"
+                        sh "docker inspect --format '{{ (.NetworkSettings.Ports) }}' ${container_name}"
+                        sh "docker inspect --format '{{ (.NetworkSettings.Ports) }}' ${container_name} | grep map | grep '80/tcp:' | wc -l | tr -d '\n' > /tmp/test_results"
+                        expected_results = 1
+                    }
+                    else if (test_num == 2)
+                    {
+                        // Test there's nothing established on the port since nginx is not running:
+                        sh "docker exec -t ${container_name} ss -apn | grep 80 | grep ESTABLISHED | wc -l | tr -d '\n' > /tmp/test_results"
+                        expected_results = 0
+                    }
+                    else
+                    {
+                        err_msg = "Missing Test(${test_num})"
+                        echo "ERROR: ${err_msg}"
+                        currentBuild.result = 'FAILURE'
+                        error "Failed to finish container testing with Message(${err_msg})"
+                    }
+                    
+                    // Now validate the results match the expected results
+                    stage "Test(${test_num}) - Validate Results"
+                    test_results = readFile '/tmp/test_results'
+                    echo "Test(${test_num}) Results($test_results) == Expected(${expected_results})"
+                    sh "if [ \"${test_results}\" != \"${expected_results}\" ]; then echo \" --------------------- Test(${test_num}) Failed--------------------\"; echo \" - Test(${test_num}) Failed\"; echo \" - Test(${test_num}) Failed\";exit 1; else echo \" - Test(${test_num}) Passed\"; exit 0; fi"
+                    echo "Done Running Test(${test_num})"
+                
+                    // cleanup after the test run
+                    sh "rm -f /tmp/test_results"
+                    currentBuild.result = 'SUCCESS'
+                }
+            }
+            
+        } catch (Exception err) {
+            err_msg = "Test had Exception(${err})"
+            currentBuild.result = 'FAILURE'
+            error "FAILED - Stopping build for Error(${err_msg})"
+        }
+        
+        stage "Pushing"
+        input 'Do you approve Pushing?'
+        container.push()
+        
+        currentBuild.result = 'SUCCESS'
+        
     }
-}
+    
+    stage ('helm test') {
+        
+    // run helm chart linter
+      helmLint(chart_dir)
 
-/*
-    Run a curl against a given url
- */
-def curlRun (url, out) {
-    echo "Running curl on ${url}"
+    // run dry-run helm chart installation
+      helmDeploy(
+        dry_run       : true,
+        name          : config.app.name,
+        chart_dir     : chart_dir,
+        tag           : build_tag,
+        replicas      : config.app.replicas,
+        cpu           : config.app.cpu,
+        memory        : config.app.memory
+       )
 
-    script {
-        if (out.equals('')) {
-            out = 'http_code'
-        }
-        echo "Getting ${out}"
-            def result = sh (
-                returnStdout: true,
-                script: "curl --output /dev/null --silent --connect-timeout 5 --max-time 5 --retry 5 --retry-delay 5 --retry-max-time 30 --write-out \"%{${out}}\" ${url}"
-        )
-        echo "Result (${out}): ${result}"
     }
-}
+    
+    stage ('helm deploy') {
+      
+      // Deploy using Helm chart
+      helmDeploy(
+        dry_run       : false,
+        name          : config.app.name,
+        chart_dir     : chart_dir,
+        tag           : build_tag,
+        replicas      : config.app.replicas,
+        cpu           : config.app.cpu,
+        memory        : config.app.memory
+      )
 
-/*
-    Test with a simple curl and check we get 200 back
- */
-def curlTest (namespace, out) {
-    echo "Running tests in ${namespace}"
-
-    script {
-        if (out.equals('')) {
-            out = 'http_code'
-        }
-
-        // Get deployment's service IP
-        def svc_ip = sh (
-                returnStdout: true,
-                script: "kubectl get svc -n ${namespace} | grep ${ID} | awk '{print \$3}'"
-        )
-
-        if (svc_ip.equals('')) {
-            echo "ERROR: Getting service IP failed"
-            sh 'exit 1'
-        }
-
-        echo "svc_ip is ${svc_ip}"
-        url = 'http://' + svc_ip
-
-        curlRun (url, out)
     }
-}
-
-/*
-    This is the main pipeline section with the stages of the CI/CD
- */
-pipeline {
-
-    options {
-        // Build auto timeout
-        timeout(time: 60, unit: 'MINUTES')
-    }
-
-    // Some global default variables
-    environment {
-        IMAGE_NAME = 'acme'
-        TEST_LOCAL_PORT = 8817
-        DEPLOY_PROD = false
-        PARAMETERS_FILE = "${JENKINS_HOME}/parameters.groovy"
-    }
-
-    parameters {
-        string (name: 'GIT_BRANCH',           defaultValue: 'master',  description: 'Git branch to build')
-        booleanParam (name: 'DEPLOY_TO_PROD', defaultValue: false,     description: 'If build and tests are good, proceed and deploy to production without manual approval')
-
-
-        // The commented out parameters are for optionally using them in the pipeline.
-        // In this example, the parameters are loaded from file ${JENKINS_HOME}/parameters.groovy later in the pipeline.
-        // The ${JENKINS_HOME}/parameters.groovy can be a mounted secrets file in your Jenkins container.
-/*
-        string (name: 'DOCKER_REG',       defaultValue: 'docker-artifactory.my',                   description: 'Docker registry')
-        string (name: 'DOCKER_TAG',       defaultValue: 'dev',                                     description: 'Docker tag')
-        string (name: 'DOCKER_USR',       defaultValue: 'admin',                                   description: 'Your helm repository user')
-        string (name: 'DOCKER_PSW',       defaultValue: 'password',                                description: 'Your helm repository password')
-        string (name: 'IMG_PULL_SECRET',  defaultValue: 'docker-reg-secret',                       description: 'The Kubernetes secret for the Docker registry (imagePullSecrets)')
-        string (name: 'HELM_REPO',        defaultValue: 'https://artifactory.my/artifactory/helm', description: 'Your helm repository')
-        string (name: 'HELM_USR',         defaultValue: 'admin',                                   description: 'Your helm repository user')
-        string (name: 'HELM_PSW',         defaultValue: 'password',                                description: 'Your helm repository password')
-*/
-    }
-
-    // In this example, all is built and run from the master
-    agent { node { label 'master' } }
-
-    // Pipeline stages
-    stages {
-
-        ////////// Step 1 //////////
-        stage('Git clone and setup') {
-            steps {
-                echo "Check out acme code"
-                git branch: "master",
-                        credentialsId: 'eldada-bb',
-                        url: 'https://github.com/eldada/jenkins-pipeline-kubernetes.git'
-
-                // Validate kubectl
-                sh "kubectl cluster-info"
-
-                // Init helm client
-                sh "helm init"
-
-                // Make sure parameters file exists
-                script {
-                    if (! fileExists("${PARAMETERS_FILE}")) {
-                        echo "ERROR: ${PARAMETERS_FILE} is missing!"
-                    }
-                }
-
-                // Load Docker registry and Helm repository configurations from file
-                load "${JENKINS_HOME}/parameters.groovy"
-
-                echo "DOCKER_REG is ${DOCKER_REG}"
-                echo "HELM_REPO  is ${HELM_REPO}"
-
-                // Define a unique name for the tests container and helm release
-                script {
-                    branch = GIT_BRANCH.replaceAll('/', '-').replaceAll('\\*', '-')
-                    ID = "${IMAGE_NAME}-${DOCKER_TAG}-${branch}"
-
-                    echo "Global ID set to ${ID}"
-                }
-            }
-        }
-
-        ////////// Step 2 //////////
-        stage('Build and tests') {
-            steps {
-                echo "Building application and Docker image"
-                sh "${WORKSPACE}/build.sh --build --registry ${DOCKER_REG} --tag ${DOCKER_TAG} --docker_usr ${DOCKER_USR} --docker_psw ${DOCKER_PSW}"
-
-                echo "Running tests"
-
-                // Kill container in case there is a leftover
-                sh "[ -z \"\$(docker ps -a | grep ${ID} 2>/dev/null)\" ] || docker rm -f ${ID}"
-
-                echo "Starting ${IMAGE_NAME} container"
-                sh "docker run --detach --name ${ID} --rm --publish ${TEST_LOCAL_PORT}:80 ${DOCKER_REG}/${IMAGE_NAME}:${DOCKER_TAG}"
-
-                script {
-                    host_ip = sh(returnStdout: true, script: '/sbin/ip route | awk \'/default/ { print $3 ":${TEST_LOCAL_PORT}" }\'')
-                }
-            }
-        }
-
-        // Run the 3 tests on the currently running ACME Docker container
-        stage('Local tests') {
-            parallel {
-                stage('Curl http_code') {
-                    steps {
-                        curlRun ("http://${host_ip}", 'http_code')
-                    }
-                }
-                stage('Curl total_time') {
-                    steps {
-                        curlRun ("http://${host_ip}", 'total_time')
-                    }
-                }
-                stage('Curl size_download') {
-                    steps {
-                        curlRun ("http://${host_ip}", 'size_download')
-                    }
-                }
-            }
-        }
-
-        ////////// Step 3 //////////
-        stage('Publish Docker and Helm') {
-            steps {
-                echo "Stop and remove container"
-                sh "docker stop ${ID}"
-
-                echo "Pushing ${DOCKER_REG}/${IMAGE_NAME}:${DOCKER_TAG} image to registry"
-                sh "${WORKSPACE}/build.sh --push --registry ${DOCKER_REG} --tag ${DOCKER_TAG} --docker_usr ${DOCKER_USR} --docker_psw ${DOCKER_PSW}"
-
-                echo "Packing helm chart"
-                sh "${WORKSPACE}/build.sh --pack_helm --push_helm --helm_repo ${HELM_REPO} --helm_usr ${HELM_USR} --helm_psw ${HELM_PSW}"
-            }
-        }
-
-        ////////// Step 4 //////////
-        stage('Deploy to dev') {
-            steps {
-                script {
-                    namespace = 'development'
-
-                    echo "Deploying application ${ID} to ${namespace} namespace"
-                    createNamespace (namespace)
-
-                    // Remove release if exists
-                    helmDelete (namespace, "${ID}")
-
-                    // Deploy with helm
-                    echo "Deploying"
-                    helmInstall(namespace, "${ID}")
-                }
-            }
-        }
-
-        // Run the 3 tests on the deployed Kubernetes pod and service
-        stage('Dev tests') {
-            parallel {
-                stage('Curl http_code') {
-                    steps {
-                        curlTest (namespace, 'http_code')
-                    }
-                }
-                stage('Curl total_time') {
-                    steps {
-                        curlTest (namespace, 'time_total')
-                    }
-                }
-                stage('Curl size_download') {
-                    steps {
-                        curlTest (namespace, 'size_download')
-                    }
-                }
-            }
-        }
-
-        stage('Cleanup dev') {
-            steps {
-                script {
-                    // Remove release if exists
-                    helmDelete (namespace, "${ID}")
-                }
-            }
-        }
-
-        ////////// Step 5 //////////
-        stage('Deploy to staging') {
-            steps {
-                script {
-                    namespace = 'staging'
-
-                    echo "Deploying application ${IMAGE_NAME}:${DOCKER_TAG} to ${namespace} namespace"
-                    createNamespace (namespace)
-
-                    // Remove release if exists
-                    helmDelete (namespace, "${ID}")
-
-                    // Deploy with helm
-                    echo "Deploying"
-                    helmInstall (namespace, "${ID}")
-                }
-            }
-        }
-
-        // Run the 3 tests on the deployed Kubernetes pod and service
-        stage('Staging tests') {
-            parallel {
-                stage('Curl http_code') {
-                    steps {
-                        curlTest (namespace, 'http_code')
-                    }
-                }
-                stage('Curl total_time') {
-                    steps {
-                        curlTest (namespace, 'time_total')
-                    }
-                }
-                stage('Curl size_download') {
-                    steps {
-                        curlTest (namespace, 'size_download')
-                    }
-                }
-            }
-        }
-
-        stage('Cleanup staging') {
-            steps {
-                script {
-                    // Remove release if exists
-                    helmDelete (namespace, "${ID}")
-                }
-            }
-        }
-
-        ////////// Step 6 //////////
-        // Waif for user manual approval, or proceed automatically if DEPLOY_TO_PROD is true
-        stage('Go for Production?') {
-            when {
-                allOf {
-                    environment name: 'GIT_BRANCH', value: 'master'
-                    environment name: 'DEPLOY_TO_PROD', value: 'false'
-                }
-            }
-
-            steps {
-                // Prevent any older builds from deploying to production
-                milestone(1)
-                input 'Proceed and deploy to Production?'
-                milestone(2)
-
-                script {
-                    DEPLOY_PROD = true
-                }
-            }
-        }
-
-        stage('Deploy to Production') {
-            when {
-                anyOf {
-                    expression { DEPLOY_PROD == true }
-                    environment name: 'DEPLOY_TO_PROD', value: 'true'
-                }
-            }
-
-            steps {
-                script {
-                    DEPLOY_PROD = true
-                    namespace = 'production'
-
-                    echo "Deploying application ${IMAGE_NAME}:${DOCKER_TAG} to ${namespace} namespace"
-                    createNamespace (namespace)
-
-                    // Deploy with helm
-                    echo "Deploying"
-                    helmInstall (namespace, "${ID}")
-                }
-            }
-        }
-
-        // Run the 3 tests on the deployed Kubernetes pod and service
-        stage('Production tests') {
-            when {
-                expression { DEPLOY_PROD == true }
-            }
-
-            parallel {
-                stage('Curl http_code') {
-                    steps {
-                        curlTest (namespace, 'http_code')
-                    }
-                }
-                stage('Curl total_time') {
-                    steps {
-                        curlTest (namespace, 'time_total')
-                    }
-                }
-                stage('Curl size_download') {
-                    steps {
-                        curlTest (namespace, 'size_download')
-                    }
-                }
-            }
-        }
-    }
+    
+    ///////////////////////////////////////
+    //
+    // Coming Soon Feature Enhancements
+    //
+    // 1. Add Docker Compose testing as a new Pipeline item that is initiated after this one for "Integration" testing
+    // 2. Make sure to set the Pipeline's "Throttle builds" to 1 because the docker containers will collide on resources like ports and names
+    // 3. Should be able to parallelize the docker.withRegistry() methods to ensure the container is running on the slave
+    // 4. After the tests finish (and before they start), clean up container images to prevent stale docker image builds from affecting the current test run
 }

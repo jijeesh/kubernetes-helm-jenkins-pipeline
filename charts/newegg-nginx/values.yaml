@@ -1,0 +1,15 @@
+# Default values 
+# This is a YAML-formatted file.
+# Declare name/value pairs to be passed into your templates.
+# name: value
+
+ServiceType: NodePort
+Image: judexzhu/nginx-test
+Imagetag: 'latest'
+Replicas: 3
+ImagePullPolicy: "Always"
+Cpu: "10m"
+Memory: "128Mi"
+ContainerPort: 80
+ServicePort: 80
+DomainName: newegg-nginx
