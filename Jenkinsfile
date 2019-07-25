@@ -1,21 +1,21 @@
 podTemplate(
-    label: 'mypod', 
+    label: 'mypod',
     inheritFrom: 'default',
     containers: [
         containerTemplate(
-            name: 'golang', 
+            name: 'golang',
             image: 'golang:1.10-alpine',
             ttyEnabled: true,
             command: 'cat'
         ),
         containerTemplate(
-            name: 'docker', 
+            name: 'docker',
             image: 'docker:18.02',
             ttyEnabled: true,
             command: 'cat'
         ),
         containerTemplate(
-            name: 'helm', 
+            name: 'helm',
             image: 'ibmcom/k8s-helm:v2.6.0',
             ttyEnabled: true,
             command: 'cat'
@@ -42,10 +42,17 @@ podTemplate(
         def repository
         stage ('Docker') {
             container ('docker') {
-                def registryIp = sh(script: 'getent hosts registry.kube-system | awk \'{ print $1 ; exit }\'', returnStdout: true).trim()
-                repository = "${registryIp}:80/hello"
-                sh "docker build -t ${repository}:${commitId} ."
-                sh "docker push ${repository}:${commitId}"
+              docker.withRegistry('https://harbor.servers.k8s.nestgroup.net/demo-public/', 'docker-registry') {
+
+                def customImage = docker.build("${repository}:${commitId}")
+
+                /* Push the container to the custom Registry */
+                customImage.push()
+                }
+                // def registryIp = sh(script: 'getent hosts registry.kube-system | awk \'{ print $1 ; exit }\'', returnStdout: true).trim()
+                // repository = "${registryIp}:80/hello"
+                // sh "docker build -t ${repository}:${commitId} ."
+                // sh "docker push ${repository}:${commitId}"
             }
         }
         stage ('Deploy') {
